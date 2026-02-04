@@ -7,52 +7,84 @@ jobs:
   stream_job:
     runs-on: ubuntu-latest
     steps:
-      - name: Install Tools
+      - name: 🛠 Install Environment
         run: |
           sudo apt-get update && sudo apt-get install -y ffmpeg
           pip install telethon
           npm install -g localtunnel
 
-      - name: Process and Host
+      - name: 🚀 Process and Host
         env:
           MSG_ID: ${{ github.event.client_payload.msg_id }}
           USER_ID: ${{ github.event.client_payload.user_id }}
+          CHANNEL_ID: ${{ github.event.client_payload.chat_id }}
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         run: |
-          # 1. Download and create HLS segments in a folder named 'stream'
-          python - << 'EOF' &
-          import os
-          from telethon.sync import TelegramClient
-          client = TelegramClient('bot', os.getenv('TG_API_ID'), os.getenv('TG_API_HASH')).start(bot_token=os.getenv('TG_BOT_TOKEN'))
-          
+          # 1. Create directory for streaming segments
+          mkdir -p stream
+
+          # 2. Run Telethon + FFmpeg in the background
+          # This downloads and converts simultaneously (Piping)
+          python3 - << 'EOF' &
+          import os, subprocess, asyncio
+          from telethon import TelegramClient
+
           async def run():
-              msg = await client.get_messages(-100123456789, ids=int(os.getenv('MSG_ID')))
-              os.makedirs('stream', exist_ok=True)
-              # Direct pipe to ffmpeg for HLS
-              cmd = f"ffmpeg -i pipe:0 -codec copy -hls_time 10 -hls_list_size 0 -f hls stream/play.m3u8"
-              import subprocess
-              proc = subprocess.Popen(cmd.split(), stdin=subprocess.PIPE)
+              client = TelegramClient('bot', os.getenv('TG_API_ID'), os.getenv('TG_API_HASH'))
+              await client.start(bot_token=os.getenv('TG_BOT_TOKEN'))
+              
+              # Get message from the channel sent by the bot
+              # Using int() because IDs from JSON are often strings
+              msg = await client.get_messages(int(os.getenv('CHANNEL_ID')), ids=int(os.getenv('MSG_ID')))
+              
+              # FFmpeg command: Repackage to HLS without re-encoding (Fast)
+              cmd = [
+                  'ffmpeg', '-i', 'pipe:0', 
+                  '-codec', 'copy', 
+                  '-start_number', '0', 
+                  '-hls_time', '10', 
+                  '-hls_list_size', '0', 
+                  '-f', 'hls', 'stream/play.m3u8'
+              ]
+              
+              proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+              
               async for chunk in client.iter_download(msg.media):
-                  proc.stdin.write(chunk)
+                  if chunk:
+                      proc.stdin.write(chunk)
+              
               proc.stdin.close()
-          with client: client.loop.run_until_complete(run())
+              proc.wait()
+
+          asyncio.run(run())
           EOF
 
-          # 2. Start Web Server
+          # 3. Start local web server on port 8000
           python3 -m http.server 8000 & 
 
-          # 3. Start Tunnel and Notify User
-          # We wait 10 seconds for HLS to start generating
-          sleep 10
+          # 4. Launch Tunnel and extract URL
+          # We loop until localtunnel successfully gives us a URL
+          echo "Starting tunnel..."
           lt --port 8000 > url.txt &
-          sleep 5
-          TUNNEL_URL=$(cat url.txt | grep -o 'https://[^ ]*')
           
+          counter=0
+          while ! grep -q "https://" url.txt; do
+            sleep 2
+            counter=$((counter+1))
+            if [ $counter -gt 15 ]; then echo "Tunnel failed"; exit 1; fi
+          done
+          
+          TUNNEL_URL=$(grep -o 'https://[^ ]*' url.txt)
+          echo "Public URL: $TUNNEL_URL"
+
+          # 5. Send the final .m3u8 link back to the user
           curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
-            -d "chat_id=$USER_ID&text=📺 Stream Server Online:%0A$TUNNEL_URL/stream/play.m3u8%0A%0A(Note: Server closes in 6 hours or when finished)"
-          
-          # 4. Keep the runner alive for the duration of the stream
-          # Adjust sleep time based on video length or use a loop
+            -d "chat_id=$USER_ID" \
+            -d "parse_mode=Markdown" \
+            -d "text=✅ *Stream Server is Live!*%0A%0A🔗 *Playable Link:*%0A\`$TUNNEL_URL/stream/play.m3u8\`%0A%0A📂 *How to play:*%0A1. Copy the link above.%0A2. Open VLC Media Player.%0A3. Go to 'Network Stream' and Paste.%0A%0A⚠️ *Note:* Server stays alive for 2 hours."
+
+          # 6. Keep the runner alive for 2 hours (7200 seconds)
+          # The runner will auto-shutdown after this, cleaning all data.
           sleep 7200
