@@ -1,0 +1,58 @@
+name: GHA Stream Server
+on:
+  repository_dispatch:
+    types: [run_stream_server]
+
+jobs:
+  stream_job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+          pip install telethon
+          npm install -g localtunnel
+
+      - name: Process and Host
+        env:
+          MSG_ID: ${{ github.event.client_payload.msg_id }}
+          USER_ID: ${{ github.event.client_payload.user_id }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+        run: |
+          # 1. Download and create HLS segments in a folder named 'stream'
+          python - << 'EOF' &
+          import os
+          from telethon.sync import TelegramClient
+          client = TelegramClient('bot', os.getenv('TG_API_ID'), os.getenv('TG_API_HASH')).start(bot_token=os.getenv('TG_BOT_TOKEN'))
+          
+          async def run():
+              msg = await client.get_messages(-100123456789, ids=int(os.getenv('MSG_ID')))
+              os.makedirs('stream', exist_ok=True)
+              # Direct pipe to ffmpeg for HLS
+              cmd = f"ffmpeg -i pipe:0 -codec copy -hls_time 10 -hls_list_size 0 -f hls stream/play.m3u8"
+              import subprocess
+              proc = subprocess.Popen(cmd.split(), stdin=subprocess.PIPE)
+              async for chunk in client.iter_download(msg.media):
+                  proc.stdin.write(chunk)
+              proc.stdin.close()
+          with client: client.loop.run_until_complete(run())
+          EOF
+
+          # 2. Start Web Server
+          python3 -m http.server 8000 & 
+
+          # 3. Start Tunnel and Notify User
+          # We wait 10 seconds for HLS to start generating
+          sleep 10
+          lt --port 8000 > url.txt &
+          sleep 5
+          TUNNEL_URL=$(cat url.txt | grep -o 'https://[^ ]*')
+          
+          curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
+            -d "chat_id=$USER_ID&text=📺 Stream Server Online:%0A$TUNNEL_URL/stream/play.m3u8%0A%0A(Note: Server closes in 6 hours or when finished)"
+          
+          # 4. Keep the runner alive for the duration of the stream
+          # Adjust sleep time based on video length or use a loop
+          sleep 7200
