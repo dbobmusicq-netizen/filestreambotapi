@@ -7,13 +7,13 @@ jobs:
   stream_job:
     runs-on: ubuntu-latest
     steps:
-      - name: Install Tools
+      - name: Setup Tools
         run: |
           sudo apt-get update && sudo apt-get install -y ffmpeg
           pip install telethon
           npm install -g localtunnel
 
-      - name: Process and Host
+      - name: Instant Stream
         env:
           MSG_ID: ${{ github.event.client_payload.msg_id }}
           USER_ID: ${{ github.event.client_payload.user_id }}
@@ -23,45 +23,50 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         run: |
           mkdir -p stream
-
-          # 1. Download and Convert (Piped)
+          
+          # 1. Start Web Server IMMEDIATELY
           python3 - << 'EOF' &
+          from http.server import HTTPServer, SimpleHTTPRequestHandler
+          class CORSHandler(SimpleHTTPRequestHandler):
+              def end_headers(self):
+                  self.send_header('Access-Control-Allow-Origin', '*')
+                  self.send_header('Bypass-Tunnel-Reminder', 'true')
+                  super().end_headers()
+          HTTPServer(('0.0.0.0', 8000), CORSHandler).serve_forever()
+          EOF
+
+          # 2. Start Tunnel and Get URL IMMEDIATELY
+          lt --port 8000 > url.txt &
+          sleep 5
+          TUNNEL_URL=$(grep -o 'https://[^ ]*' url.txt)
+          
+          # 3. Notify user IMMEDIATELY (Before video even starts downloading)
+          PLAYER_URL="https://dbobmusicq-netizen.github.io/filestreambotapi/?url=$TUNNEL_URL/stream/play.m3u8"
+          curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
+            -d "chat_id=$USER_ID" \
+            -d "parse_mode=Markdown" \
+            -d "text=🎬 *Stream Starting...*%0A%0A[▶️ Click to Watch Now]($PLAYER_URL)%0A%0A_Buffering starts in 5-10 seconds..._"
+
+          # 4. NOW start the heavy download and conversion
+          python3 - << 'EOF'
           import os, subprocess, asyncio
           from telethon import TelegramClient
           async def run():
               client = TelegramClient('bot', os.getenv('TG_API_ID'), os.getenv('TG_API_HASH'))
               await client.start(bot_token=os.getenv('TG_BOT_TOKEN'))
               msg = await client.get_messages(int(os.getenv('CHANNEL_ID')), ids=int(os.getenv('MSG_ID')))
-              cmd = ['ffmpeg', '-i', 'pipe:0', '-codec', 'copy', '-hls_time', '10', '-hls_list_size', '0', '-f', 'hls', 'stream/play.m3u8']
+              
+              # Piped FFmpeg (Starts writing segments instantly)
+              cmd = ['ffmpeg', '-i', 'pipe:0', '-codec', 'copy', '-hls_time', '5', '-hls_list_size', '0', '-f', 'hls', 'stream/play.m3u8']
               proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+              
               async for chunk in client.iter_download(msg.media):
                   if chunk: proc.stdin.write(chunk)
+              
               proc.stdin.close()
               proc.wait()
           asyncio.run(run())
           EOF
 
-          # 2. Start CORS-Enabled Web Server (Important for GitHub Pages)
-          python3 - << 'EOF' &
-          from http.server import HTTPServer, SimpleHTTPRequestHandler
-          class CORSHandler(SimpleHTTPRequestHandler):
-              def end_headers(self):
-                  self.send_header('Access-Control-Allow-Origin', '*')
-                  super().end_headers()
-          HTTPServer(('0.0.0.0', 8000), CORSHandler).serve_forever()
-          EOF
-
-          # 3. Start Tunnel
-          lt --port 8000 > url.txt &
-          sleep 10
-          TUNNEL_URL=$(grep -o 'https://[^ ]*' url.txt)
-          
-          # 4. Final Link (GitHub Page + Tunnel Source)
-          PLAYER_URL="https://dbobmusicq-netizen.github.io/filestreambotapi/?url=$TUNNEL_URL/stream/play.m3u8"
-          
-          curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
-            -d "chat_id=$USER_ID" \
-            -d "parse_mode=Markdown" \
-            -d "text=🎬 *Your Movie is Ready!*%0A%0A[Click here to Watch on GitHub Page]($PLAYER_URL)"
-
+          # 5. Wait for the user to finish watching
           sleep 7200
